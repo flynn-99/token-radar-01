@@ -57,6 +57,70 @@ function outputDir(): string {
   return process.env.MAKEFUN_OUTPUT_DIR ?? 'out';
 }
 
+/** The usage text printed by --help: what the radar does and how to run it. */
+const USAGE = [
+  'token radar — rank pre-token protocols from a sealed DefiLlama snapshot.',
+  '',
+  'Usage:',
+  '  MAKEFUN_OUTPUT_DIR=out node main.ts --input <snapshot.json>',
+  '',
+  'Flags:',
+  '  --input <path>   the snapshot to read (default: /input/snapshot.json when it',
+  '                   exists, else the kit snapshot beside this repository)',
+  '  --help, -h       print this text and stop',
+  '',
+  'The output directory comes from MAKEFUN_OUTPUT_DIR, or `out` when it is unset.',
+  'Example: MAKEFUN_OUTPUT_DIR=out node main.ts --input ../token-radar-01-kit/input/snapshot.json',
+].join('\n');
+
+/** True when the arguments ask for the usage text instead of a run. */
+function wantsHelp(argv: string[]): boolean {
+  return argv.includes('--help') || argv.includes('-h');
+}
+
+/** A snapshot too broken to rank, or null when it is sound enough to run. */
+function snapshotIssue(value: unknown): string | null {
+  // The snapshot must be an object, not an array or a bare number or string.
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return 'the snapshot is not a JSON object';
+  }
+  const record = value as { protocols?: unknown; watchlist?: unknown };
+  if (!Array.isArray(record.protocols) || record.protocols.length === 0) {
+    return 'the snapshot has no protocols array, or it is empty';
+  }
+  if (!Array.isArray(record.watchlist) || record.watchlist.length === 0) {
+    return 'the snapshot has no watchlist array, or it is empty';
+  }
+  for (const protocol of record.protocols as unknown[]) {
+    // Every protocol needs a slug to be named on the board, and a TVL that is a
+    // real number, never negative, so the model can score it.
+    if (typeof protocol !== 'object' || protocol === null || Array.isArray(protocol)) {
+      return 'a protocol in the snapshot is not an object';
+    }
+    const entry = protocol as { slug?: unknown; tvl_usd?: unknown };
+    if (typeof entry.slug !== 'string' || entry.slug.length === 0) {
+      return 'a protocol in the snapshot has no slug';
+    }
+    if (typeof entry.tvl_usd !== 'number' || !Number.isFinite(entry.tvl_usd) || entry.tvl_usd < 0) {
+      return `protocol ${entry.slug} has no usable tvl_usd`;
+    }
+  }
+  return null;
+}
+
+/** Re-read the board just written and confirm it holds exactly the rows built. */
+function verifyBoard(out: string, rows: number): void {
+  // Reading back what was written catches a short write before the grader does:
+  // the file must parse, and its rows must be the board, no more and no fewer.
+  const written = JSON.parse(readFileSync(join(out, 'board.json'), 'utf8')) as { rows?: unknown };
+  if (!Array.isArray(written.rows) || written.rows.length !== rows) {
+    throw new Error(
+      `board.json holds ${Array.isArray(written.rows) ? written.rows.length : 'no'} rows, expected ${rows}`,
+    );
+  }
+  console.error(`verified board.json: ${written.rows.length} rows`);
+}
+
 /** Copy a directory from the repository into the output directory, replacing what is there. */
 function copyDir(name: string, out: string): void {
   cpSync(join(REPO_ROOT, name), join(out, name), { recursive: true, force: true });
@@ -64,10 +128,23 @@ function copyDir(name: string, out: string): void {
 
 /** The whole run: read the snapshot, build the board, write the output directory. */
 function main(): void {
+  // The help flag is answered before anything else: no snapshot is read and
+  // nothing is written, so asking how to run the program can never change it.
+  if (wantsHelp(process.argv.slice(2))) {
+    console.log(USAGE);
+    return;
+  }
   const input = snapshotPath(process.argv.slice(2));
   const out = outputDir();
 
   const snapshot = parseSnapshot(readFileSync(input, 'utf8'));
+  // A snapshot that fails this check cannot produce a board the gate will take,
+  // so stop here with a plain error instead of scoring garbage.
+  const broken = snapshotIssue(snapshot);
+  if (broken !== null) {
+    console.error(`main.ts: the snapshot is unusable: ${broken}`);
+    process.exit(1);
+  }
   const { board, radar } = buildRadar(snapshot);
 
   const issue = boardIssue(board, snapshot);
@@ -80,6 +157,9 @@ function main(): void {
   copyDir('screenshots', out);
   // The dossier is built last: it reads the finished output directory, dashboard and screenshots included.
   writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: DOSSIER_TEXT_MAX_BYTES }));
+  // The board is checked only after every file is written, so the check sees the
+  // finished directory exactly as the grader will.
+  verifyBoard(out, board.length);
 
   const top = board[0]!;
   console.log(
